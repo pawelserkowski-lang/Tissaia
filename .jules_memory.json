@@ -1,0 +1,17 @@
+{
+  "history": [
+    {
+      "error_signature": "ImportError: cannot import name 'Config' from 'src.config'",
+      "strategy_used": "Update test to match module-level configuration pattern",
+      "outcome": "FIXED",
+      "timestamp": "2024-10-24T12:00:00Z"
+    },
+    {
+      "error_signature": "ImportError: cannot import name 'AIService' from 'src.ai_core'",
+      "strategy_used": "Update test to match functional architecture (no classes, just functions)",
+      "outcome": "FIXED",
+      "timestamp": "2024-10-24T12:05:00Z"
+    }
+  ],
+  "unresolved_issues": []
+}
