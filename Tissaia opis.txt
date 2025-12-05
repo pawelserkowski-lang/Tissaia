@@ -1,0 +1,378 @@
+Stwórz aplikację o nazwie Tissaia która:
+1. Wycina bardzo dokładnie zdjęcia na podstawie znajdowania narożników i tworzy mapę wycięć na której są ponumerowane zdjćia. Minimalne parametry wycięcia to 10% zdjęcia maksymalne 90%
+2. Używa:
+MODEL_DETECTION = "models/gemini-3-pro-preview" do dokładnego opisu zdjęcia
+MODEL_RESTORATION = "models/gemini-3-pro-image-preview" do wygenerwoania nowej wersji zdjęcia
+3. Wygenerowanie nowej wersja zdjęcia powinno wyglądać tak:
+- prostowanie i kadrowanie
+- uzupełnanie braków przez wypełnanie generatywne (wcianmy się 10% w głąb zdjęcia żeby AI miało na czym pracować)
+- usuwanie śmieci, szumów oraz zgjęć
+- odszumianie i poprawa jakośći
+- koloryzacja
+- generowanie w wysokiej jakości HDR 
+
+3. Końcowy efekt:
+- zachowane szczegóły twarzy przez użycie metod Forensic Image Enhancement
+- efekt zdjęcia studyjnego
+- brak ramek i braków, pełne zdjęcie
+- Wysokiej jakości zdjęcie HDR
+- szczegółowe wyraźne twarze 
+
+Kod pierwotny:
+import os
+import zipfile
+import time
+import requests
+import base64
+import json
+import re
+import io
+import numpy as np
+import concurrent.futures
+import random
+from dotenv import load_dotenv
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
+
+# ==========================================
+# 1. KONFIGURACJA
+# ==========================================
+load_dotenv()
+api_key = os.environ.get("GOOGLE_API_KEY")
+
+if not api_key:
+    print("❌ Błąd: Brak klucza GOOGLE_API_KEY w pliku .env")
+    exit()
+
+# ZACHOWANA SZYBKOŚĆ
+MAX_WORKERS = 20
+
+MODEL_DETECTION = "models/gemini-3-pro-preview" 
+MODEL_RESTORATION = "models/gemini-3-pro-image-preview"
+
+INPUT_ZIP = "zdjecia.zip"
+OUTPUT_DIR = "odnowione_final"
+
+# ==========================================
+# 2. NARZĘDZIA SYSTEMOWE
+# ==========================================
+
+def encode_image_optimized(image_path, max_size=3500):
+    with Image.open(image_path) as img:
+        if img.mode != "RGB": img = img.convert("RGB")
+        if max(img.size) > max_size: img.thumbnail((max_size, max_size))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=93)
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
+
+def make_request_with_retry(url, json_payload, headers, max_retries=15):
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, json=json_payload, headers=headers, timeout=600)
+            
+            if response.status_code == 404: return response
+            
+            if response.status_code in [429, 500, 502, 503, 504]:
+                wait = (attempt + 1) * 5 + random.randint(5, 15)
+                time.sleep(wait)
+                continue
+                
+            return response
+        except Exception:
+            time.sleep(5)
+    return None
+
+# ==========================================
+# 3. GRAFIKA: DOCINANIE I WYOSTRZANIE
+# ==========================================
+
+def aggressive_trim_borders(img):
+    try:
+        bg = Image.new(img.mode, img.size, img.getpixel((0, 0)))
+        diff = ImageChops.difference(img, bg)
+        diff = ImageChops.add(diff, diff, 2.0, -100)
+        bbox = diff.getbbox()
+        if bbox:
+            if (bbox[2]-bbox[0]) < 50 or (bbox[3]-bbox[1]) < 50:
+                return img
+            return img.crop(bbox)
+    except: pass
+    return img
+
+def apply_super_sharpen(img):
+    # Sprawdzony setup
+    enhancer = ImageEnhance.Sharpness(img)
+    img = enhancer.enhance(1.5) 
+    img = img.filter(ImageFilter.UnsharpMask(radius=3, percent=150, threshold=3))
+    return img
+
+def warp_perspective(img, corners):
+    def find_coeffs(pa, pb):
+        matrix = []
+        for p1, p2 in zip(pa, pb):
+            matrix.append([p1[0], p1[1], 1, 0, 0, 0, -p1[0]*p2[0], -p1[0]*p2[1]])
+            matrix.append([0, 0, 0, p1[0], p1[1], 1, -p1[1]*p2[0], -p1[1]*p2[1]])
+        A = np.matrix(matrix, dtype=float)
+        B = np.array(pb).reshape(8)
+        try:
+            res = np.dot(np.linalg.inv(A.T * A) * A.T, B)
+            return np.array(res).reshape(8)
+        except: return None
+
+    pts = np.array(corners, dtype="float32")
+    s = pts.sum(axis=1); diff = np.diff(pts, axis=1)
+    tl = pts[np.argmin(s)]; br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]; bl = pts[np.argmax(diff)]
+
+    wA = np.sqrt(((br[0]-bl[0])**2) + ((br[1]-bl[1])**2)); wB = np.sqrt(((tr[0]-tl[0])**2) + ((tr[1]-tl[1])**2))
+    maxWidth = max(int(wA), int(wB))
+    hA = np.sqrt(((tr[0]-br[0])**2) + ((tr[1]-br[1])**2)); hB = np.sqrt(((tl[0]-bl[0])**2) + ((tl[1]-bl[1])**2))
+    maxHeight = max(int(hA), int(hB))
+
+    target = [(0, 0), (maxWidth, 0), (maxWidth, maxHeight), (0, maxHeight)]
+    source = [(tl[0], tl[1]), (tr[0], tr[1]), (br[0], br[1]), (bl[0], bl[1])]
+    coeffs = find_coeffs(target, source)
+    
+    if coeffs is not None:
+        return img.transform((maxWidth, maxHeight), Image.PERSPECTIVE, coeffs, Image.BICUBIC)
+    return img
+
+# ==========================================
+# 4. LOGIKA AI: ROTACJA I DETEKCJA
+# ==========================================
+
+def detect_rotation_strict(image_path):
+    """
+    NOWA LOGIKA ROTACJI: Opisowa, nie matematyczna.
+    Zadajemy pytanie: "Gdzie jest góra głów?"
+    """
+    clean_model = MODEL_DETECTION.replace("models/", "")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    try:
+        # Używamy 800px, żeby model wyraźnie widział twarze
+        with Image.open(image_path) as img:
+            img.thumbnail((800, 800))
+            buf = io.BytesIO(); img.save(buf, format="JPEG"); b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        
+        # PROMPT SEMANTYCZNY (Znacznie skuteczniejszy)
+        prompt = (
+            "Look at the people in this photo. Find their faces and hair.\n"
+            "Task: In which direction is the TOP OF THEIR HEADS pointing?\n"
+            "Options: 'UP' (normal), 'DOWN' (upside down), 'LEFT' (sideways left), 'RIGHT' (sideways right).\n"
+            "Output ONLY valid JSON: {\"direction\": \"UP\"}"
+        )
+        
+        payload = {"contents": [{"parts": [{"text": prompt}, {"inlineData": {"mimeType": "image/jpeg", "data": b64}}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0}}
+        
+        response = make_request_with_retry(url, payload, headers)
+        if response and response.status_code == 200:
+            res = json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+            direction = res.get("direction", "UP")
+            
+            # Konwersja Kierunek Głów -> Ile obrócić w LEWO (Counter-Clockwise - domyślne PIL)
+            # PIL .rotate(90) obraca w lewo (przeciwnie do zegara)
+            
+            if direction == "UP": return 0      # Jest OK
+            if direction == "DOWN": return 180  # Obrót o 180
+            if direction == "RIGHT": return 90  # Głowy w prawo -> Obróć 90 w lewo -> OK
+            if direction == "LEFT": return 270  # Głowy w lewo -> Obróć 270 w lewo (to to samo co 90 w prawo) -> OK
+            
+    except: pass
+    return 0
+
+def detect_exact_corners(image_path):
+    """
+    Detect 4 corners logic. (Tym razem nie musimy podawać kąta, bo obraz jest już obracany fizycznie przed tą funkcją)
+    """
+    clean_model = MODEL_DETECTION.replace("models/", "")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    
+    try:
+        b64_data = encode_image_optimized(image_path, max_size=1500) 
+        prompt = "Analyze scan. Detect 4 EXACT CORNERS of photo content. JSON: { \"photos\": [ { \"corners\": [[x_tl,y], [x_tr,y], [x_br,y], [x_bl,y]] } ] } Scale 0-1000."
+        payload = {"contents": [{"parts": [{"text": prompt}, {"inlineData": {"mimeType": "image/jpeg", "data": b64_data}}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0}}
+
+        response = make_request_with_retry(url, payload, headers)
+        if response and response.status_code == 404:
+             url = url.replace("v1beta", "v1alpha")
+             response = make_request_with_retry(url, payload, headers)
+
+        if response and response.status_code == 200:
+             txt = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+             return json.loads(re.sub(r"```json|```", "", txt).strip())
+    except: pass
+    return None
+
+def restore_generative_final(image_path, save_path):
+    clean_model = MODEL_RESTORATION.replace("models/", "")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    
+    try:
+        b64_data = encode_image_optimized(image_path, max_size=4000)
+        
+        # PROMPT POZOSTAJE BEZ ZMIAN
+        prompt = (
+            "Expert photo restoration AI. Task: Maximize Sharpness, Fix geometry, HDR Colorization.\n"
+            "1. GEOMETRY: The photo is straightened. GENERATIVELY INPAINT missing corners using inner context (walls, floor).\n"
+            "2. FLASH REMOVAL: Aggressively neutralize flash glare hotspots on faces.\n"
+            "3. CLEANUP: Remove grain, noise, dust.\n"
+            "4. FACES: Lock facial features strictly. Natural skin tone (not plastic).\n"
+            "5. OUTPUT: Full image, no borders."
+        )
+        payload = {"contents": [{"parts": [{"text": prompt}, {"inlineData": {"mimeType": "image/jpeg", "data": b64_data}}]}], "generationConfig": {"temperature": 0.35}}
+
+        response = make_request_with_retry(url, payload, headers)
+        if response and response.status_code == 404:
+            url = url.replace("v1beta", "v1alpha")
+            response = make_request_with_retry(url, payload, headers)
+
+        if not response or response.status_code != 200: return False
+
+        data = response.json()
+        if "candidates" in data:
+            parts = data["candidates"][0]["content"]["parts"]
+            for part in parts:
+                if "inlineData" in part:
+                    img = Image.open(io.BytesIO(base64.b64decode(part["inlineData"]["data"])))
+                    
+                    # Finalne przetwarzanie obrazu
+                    img = aggressive_trim_borders(img)
+                    img = apply_super_sharpen(img)
+                    
+                    img.save(save_path)
+                    return True
+        return False
+    except: return False
+
+# ==========================================
+# 5. WORKER - SILNIK
+# ==========================================
+
+def process_single_file(file_path, filename):
+    results_log = []
+    temp_files_to_clean = []
+    
+    try:
+        # --- ETAP 1: NAPRAWA ROTACJI (Nowy silnik) ---
+        # Sprawdza: Gdzie ludzie mają głowy?
+        angle_to_fix = detect_rotation_strict(file_path)
+        
+        if angle_to_fix != 0:
+            img_rot = Image.open(file_path)
+            # PIL .rotate obraca w lewo. Jeśli głowy są w PRAWO, .rotate(90) postawi je do pionu.
+            # Jeśli głowy w LEWO (jak na Twoich skanach), angle=270 -> .rotate(270) = .rotate(-90) w prawo.
+            img_rot = img_rot.rotate(angle_to_fix, expand=True) 
+            
+            rand_rot = str(random.randint(10000,99999))
+            path_rotated = f"tmp_rot_{rand_rot}_{filename}"
+            img_rot.save(path_rotated)
+            
+            current_work_file = path_rotated
+            temp_files_to_clean.append(path_rotated)
+        else:
+            current_work_file = file_path
+
+        # --- ETAP 2: DETEKCJA KRAWĘDZI (Na już obróconym) ---
+        data = detect_exact_corners(current_work_file)
+        
+        processed_parts = []
+        
+        if not data or "photos" not in data or not data["photos"]:
+            # Fallback: całe zdjęcie
+            processed_parts.append(current_work_file)
+        else:
+            img_src = Image.open(current_work_file)
+            if img_src.mode != "RGB": img_src = img_src.convert("RGB")
+            w, h = img_src.size
+            
+            valid = False
+            for idx, item in enumerate(data["photos"]):
+                try:
+                    raw = item["corners"]
+                    pixels = [[(pt[0]/1000)*w, (pt[1]/1000)*h] for pt in raw]
+                    straight = warp_perspective(img_src, pixels)
+                    
+                    if straight:
+                        rand_str = f"{idx}_{random.randint(100,999)}"
+                        tmp_name = f"tmp_str_{rand_str}_{filename}"
+                        straight.save(tmp_name, quality=95)
+                        processed_parts.append(tmp_name)
+                        temp_files_to_clean.append(tmp_name)
+                        valid = True
+                except: pass
+            
+            if not valid: processed_parts.append(current_work_file)
+
+        # --- ETAP 3: RENOWACJA ---
+        for idx, spath in enumerate(processed_parts):
+            suffix = f"_foto{idx+1}" if len(processed_parts) > 1 else ""
+            final_name = f"restored_{os.path.splitext(filename)[0]}{suffix}.png"
+            final_path = os.path.join(OUTPUT_DIR, final_name)
+            
+            if os.path.exists(final_path):
+                results_log.append(f"⏩ Istnieje: {final_name}")
+                continue
+
+            print(f"🚀 [{filename}] Przetwarzanie... ")
+            success = restore_generative_final(spath, final_path)
+            
+            if success:
+                results_log.append(f"✅ Gotowe: {final_name}")
+            else:
+                results_log.append(f"❌ Błąd API: {filename}")
+
+        # Czyste sprzątanie po wątku
+        for f in temp_files_to_clean:
+            if os.path.exists(f):
+                try: os.remove(f)
+                except: pass
+
+        return results_log
+
+    except Exception as e:
+        return [f"❌ Crash {filename}: {str(e)}"]
+
+# ==========================================
+# 6. MAIN
+# ==========================================
+
+def main():
+    if not os.path.exists(INPUT_ZIP):
+        print(f"❌ Brak {INPUT_ZIP}")
+        return
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    temp_dir = "temp_input"
+    try:
+        with zipfile.ZipFile(INPUT_ZIP, 'r') as z:
+            z.extractall(temp_dir)
+    except: pass
+
+    files = [os.path.join(r, f) for r, _, fs in os.walk(temp_dir) for f in fs if f.lower().endswith(('jpg','jpeg','png'))]
+    
+    print(f"⚡ SUPER-BATCH START (20 Wątków). Semantyczna Rotacja (Góra/Lewo). Plików: {len(files)}")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_file = {
+            executor.submit(process_single_file, fpath, os.path.basename(fpath)): fpath 
+            for fpath in files
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_file):
+            try:
+                logs = future.result()
+                for log in logs: print(log)
+            except Exception as exc:
+                print(f"⚠️ Błąd wątku: {exc}")
+
+    try:
+        import shutil
+        shutil.rmtree(temp_dir)
+    except: pass
+    print("\n🏁 Gotowe.")
+
+if __name__ == "__main__":
+    main()

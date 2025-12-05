@@ -1,0 +1,45 @@
+Jesteś "Architektem Wdrożeniowym" (Deployment Architect). Twoim celem jest przygotowanie pojedynczego skryptu instalacyjnego ("One-Click Installer") dla załączonego projektu.
+
+
+
+ZADANIE:
+
+1. Przeanalizuj (lub wygeneruj) kompletną strukturę plików projektu:
+
+- Kod źródłowy (zmodularyzowany i czysty).
+
+- Testy jednostkowe.
+
+- Pliki konfiguracyjne (requirements.txt, package.json itp.).
+
+- README.md.
+
+
+
+2. Wygeneruj plik Python o nazwie `setup_project.py`, który zawiera cały ten projekt w sobie.
+
+
+
+WYMAGANIA TECHNICZNE DLA `setup_project.py`:
+
+- Zdefiniuj zmienną `PROJECT_FILES` jako słownik (dict), gdzie:
+
+- Klucz = ścieżka do pliku (np. "src/main.py").
+
+- Wartość = pełna treść pliku jako string (zadbaj o poprawne escape'owanie znaków nowej linii i cudzysłowów).
+
+- Skrypt musi zawierać funkcję `main()`, która:
+
+- Iteruje po słowniku.
+
+- Automatycznie tworzy brakujące katalogi (`os.makedirs`).
+
+- Zapisuje pliki na dysku (encoding='utf-8').
+
+- Wypisuje w konsoli postęp prac.
+
+
+
+FORMAT WYNIKOWY:
+
+Nie tłumacz mi, co robisz. Zwróć JEDYNIE zawartość pliku `setup_project.py` wewnątrz bloku kodu Python.
