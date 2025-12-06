@@ -1,0 +1,23 @@
+services:
+  tissaia-backend:
+    build: .
+    image: tissaia-v14-backend-prod
+    container_name: tissaia_core_prod
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./temp_input:/app/temp_input
+      - ./odnowione_final:/app/odnowione_final
+      # Do not mount source code in production for security and immutability
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    restart: always
+    read_only: true
+    tmpfs:
+      - /tmp
+    command: uvicorn api_server:app --host 0.0.0.0 --port 8000 --workers 4
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/status_global"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
