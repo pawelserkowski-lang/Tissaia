@@ -18,7 +18,7 @@ class JobStatus(str, Enum):
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
-    PARTIAL = "PARTIAL" # Some items failed, some succeeded
+    PARTIAL = "PARTIAL"
 
 class JobManager:
     def __init__(self):
@@ -27,7 +27,7 @@ class JobManager:
     def create_job(self, filename: str) -> str:
         job_id = str(uuid.uuid4())
         self.jobs[job_id] = {
-            "id": job_id,
+            "job_id": job_id,  # <--- FIXED: Was "id", causing Pydantic 500 error
             "filename": filename,
             "status": JobStatus.QUEUED,
             "results": [],
@@ -74,8 +74,6 @@ class JobManager:
             if not crops:
                 crops = perform_glue(img)
 
-            # If still no cuts, treat the whole image as one crop if viable, or fail?
-            # Existing logic was strict. Let's maintain strictness but log it.
             if not crops:
                 logger.warning(f"No cuts found for {filename}")
                 self.update_job(job_id, status=JobStatus.FAILED, error="No valid segments found to process.")
@@ -89,7 +87,6 @@ class JobManager:
             success_count = 0
 
             for idx, pil_crop in enumerate(crops):
-                base_name = os.path.splitext(filename)[0]
                 # Use job_id in output filename to ensure uniqueness
                 save_name = f"{job_id}_{idx+1:02d}_restored.png"
                 save_path = os.path.join(OUTPUT_DIR, save_name)
@@ -119,5 +116,5 @@ class JobManager:
             traceback.print_exc()
             self.update_job(job_id, status=JobStatus.FAILED, error=str(e))
 
-# Global instance for now, or injected in FastAPI dependency
+# Global instance for now
 job_manager = JobManager()

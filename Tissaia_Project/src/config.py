@@ -3,13 +3,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Fallback: manually read .env if load_dotenv fails or ENV var not present
 if not os.environ.get("GOOGLE_API_KEY"):
     try:
-        with open(".env", "r") as f:
-            for line in f:
-                if line.strip().startswith("GOOGLE_API_KEY="):
-                    k = line.strip().split("=", 1)[1]
-                    os.environ["GOOGLE_API_KEY"] = k.strip().strip('"').strip("'")
+        if os.path.exists(".env"):
+            with open(".env", "r") as f:
+                for line in f:
+                    if line.strip().startswith("GOOGLE_API_KEY="):
+                        k = line.strip().split("=", 1)[1]
+                        os.environ["GOOGLE_API_KEY"] = k.strip().strip('"').strip("'")
     except: pass
 
 API_KEY = os.environ.get("GOOGLE_API_KEY")

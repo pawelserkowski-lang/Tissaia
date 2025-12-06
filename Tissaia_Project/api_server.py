@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Importy lokalne
+# Local imports
 from src.config import MODEL_RESTORATION, TEMP_DIR, OUTPUT_DIR
 from src.pipeline import job_manager, JobStatus
 
@@ -127,7 +127,6 @@ def get_job_status(job_id: str):
 def get_results_legacy():
     """Legacy endpoint to list all results."""
     files = sorted([f for f in os.listdir(OUTPUT_DIR) if f.lower().endswith('.png')])
-    # Assuming localhost for simplicity as in original code, but could be dynamic
     return [{"name": f, "url": f"/output/{f}"} for f in files]
 
 if __name__ == "__main__":
