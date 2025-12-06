@@ -1,9 +1,0 @@
-services:
-  app:
-    build: .
-    image: tissaia-app
-    volumes:
-      - .:/app
-    env_file:
-      - .env
-    user: "1000:1000"
