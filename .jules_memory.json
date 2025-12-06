@@ -1,17 +1,19 @@
-{
-  "history": [
-    {
-      "error_signature": "ImportError: cannot import name 'Config' from 'src.config'",
-      "strategy_used": "Update test to match module-level configuration pattern",
-      "outcome": "FIXED",
-      "timestamp": "2024-10-24T12:00:00Z"
-    },
-    {
-      "error_signature": "ImportError: cannot import name 'AIService' from 'src.ai_core'",
-      "strategy_used": "Update test to match functional architecture (no classes, just functions)",
-      "outcome": "FIXED",
-      "timestamp": "2024-10-24T12:05:00Z"
-    }
-  ],
-  "unresolved_issues": []
-}
+@echo off
+:: Tissaia Runner - Windows Env Injection
+:: Agent: Speedster
+
+IF "%GOOGLE_API_KEY%"=="" (
+    echo [BLAD] Nie znaleziono zmiennej srodowiskowej GOOGLE_API_KEY w systemie Windows!
+    echo Ustaw ja poleceniem: setx GOOGLE_API_KEY "twoj-klucz"
+    pause
+    exit /b
+)
+
+echo [INFO] Wykryto klucz API w systemie.
+echo [INFO] Uruchamianie kontenera Tissaia...
+
+:: Uruchomienie Dockera z przekazaniem klucza (-e) i mapowaniem dysku (-v)
+docker run --rm -v "%cd%:/app" -e GOOGLE_API_KEY="%GOOGLE_API_KEY%" tissaia-app
+
+echo [DONE] Zakonczono.
+pause
