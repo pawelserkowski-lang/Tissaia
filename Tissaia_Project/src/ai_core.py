@@ -4,10 +4,13 @@ import io
 import base64
 import os
 import time
+import logging
 from PIL import Image
 from src.config import API_KEY, MODEL_RESTORATION
 from src.utils import make_request_with_retry
 from src.graphics import apply_super_sharpen
+
+logger = logging.getLogger(__name__)
 
 def get_url(m):
     clean_model = m.replace('models/', '')
@@ -32,7 +35,7 @@ def restore_image_generative(pil_img, save_path):
     b64_data = base64.b64encode(buf.getvalue()).decode('utf-8')
 
     # 2. PROMPT INŻYNIERYJNY
-    prompt = \"\"\"
+    prompt = """
     ROLE: Forensic Photo Restoration Specialist using Gemini 3 Vision.
     INPUT: A vintage photo crop (center 90%).
     
@@ -43,7 +46,7 @@ def restore_image_generative(pil_img, save_path):
     3. HDR STUDIO REMASTERING: "Kodak Portra 400" aesthetic. Soft studio lighting.
     
     OUTPUT: Return ONLY the raw restored image.
-    \"\"\"
+    """
 
     payload = {
         "contents": [{
@@ -70,16 +73,23 @@ def restore_image_generative(pil_img, save_path):
             if "candidates" in data and data["candidates"][0]["content"]["parts"]:
                 for part in data["candidates"][0]["content"]["parts"]:
                     if "inlineData" in part:
-                        img_data = base64.b64decode(part["inlineData"]["data"])
-                        restored_img = Image.open(io.BytesIO(img_data))
-                        
-                        final_img = apply_super_sharpen(restored_img)
-                        final_img.save(save_path)
-                        return True
+                        try:
+                            img_data = base64.b64decode(part["inlineData"]["data"])
+                            restored_img = Image.open(io.BytesIO(img_data))
+
+                            final_img = apply_super_sharpen(restored_img)
+                            final_img.save(save_path)
+                            return True
+                        except Exception as img_err:
+                            logger.error(f"Failed to decode or save image: {str(img_err)}")
+                            return False
+
+            logger.warning(f"Response did not contain valid inlineData. Candidates: {len(data.get('candidates', []))}")
+
         elif response:
-            print(f"API ERROR {response.status_code}: {response.text[:200]}")
+            logger.error(f"API ERROR {response.status_code}: {response.text[:200]}")
             
     except Exception as e:
-        print(f"CRITICAL EXCEPTION: {str(e)}")
+        logger.error(f"CRITICAL EXCEPTION in restore_image_generative: {str(e)}")
 
     return False

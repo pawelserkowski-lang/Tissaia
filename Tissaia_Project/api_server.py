@@ -1,18 +1,16 @@
 import os
 import shutil
-import cv2
 import uvicorn
-from typing import List
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+import uuid
+from typing import List, Optional
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from PIL import Image
 
 # Importy lokalne
 from src.config import MODEL_RESTORATION, TEMP_DIR, OUTPUT_DIR
-from src.ai_core import restore_image_generative
-from src.graphics import perform_watershed, perform_glue
+from src.pipeline import job_manager, JobStatus
 
 app = FastAPI(title="Tissaia V14 API")
 
@@ -29,86 +27,108 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 app.mount("/temp", StaticFiles(directory=TEMP_DIR), name="temp")
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
 
-STATUS = {
-    "state": "IDLE",
-    "queue": 0,
-    "current_file": ""
-}
+# --- Pydantic Models ---
 
-class StatusResponse(BaseModel):
+class JobResponse(BaseModel):
+    job_id: str
     status: str
-    model: str
-    queue: int
-    done: int
-    current: str
+    filename: str
+    message: str
 
-@app.get("/status", response_model=StatusResponse)
-def get_status():
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    progress: int
+    results: List[dict]
+    error: Optional[str] = None
+    created_at: float
+
+class SystemStatusResponse(BaseModel):
+    active_jobs: int
+    model: str
+    output_files_count: int
+
+# --- Endpoints ---
+
+@app.get("/system/status", response_model=SystemStatusResponse)
+def get_system_status():
+    """Returns general system health and stats."""
+    active_count = sum(1 for j in job_manager.jobs.values() if j["status"] in [JobStatus.QUEUED, JobStatus.PROCESSING])
     done_count = len([f for f in os.listdir(OUTPUT_DIR) if f.endswith('.png')])
     return {
-        "status": STATUS["state"],
+        "active_jobs": active_count,
         "model": MODEL_RESTORATION,
-        "queue": STATUS["queue"],
-        "done": done_count,
-        "current": STATUS["current_file"]
+        "output_files_count": done_count
     }
 
-@app.post("/upload")
-async def upload_files(files: List[UploadFile] = File(...)):
-    STATUS["state"] = "UPLOADING"
+@app.post("/upload", tags=["Legacy"])
+async def upload_files_legacy(files: List[UploadFile] = File(...)):
+    """Legacy upload endpoint. Recommend using /process/upload for single atomic operation."""
     for file in files:
         path = os.path.join(TEMP_DIR, file.filename)
         with open(path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-    STATUS["queue"] += len(files)
-    STATUS["state"] = "READY"
-    return {"message": f"Uploaded {len(files)} files"}
+    return {"message": f"Uploaded {len(files)} files. Please call /process/{files[0].filename} to start."}
 
-@app.get("/cuts")
-def get_cuts():
-    files = sorted([f for f in os.listdir(TEMP_DIR) if f.lower().endswith(('.jpg', '.png'))])
-    return [{"name": f, "url": f"http://localhost:8000/temp/{f}"} for f in files]
+@app.post("/process/upload", response_model=JobResponse)
+async def process_and_upload(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    """Atomic endpoint: Uploads file and starts processing job."""
+    try:
+        # Create a unique filename to prevent overwrite race conditions
+        file_ext = os.path.splitext(file.filename)[1]
+        unique_id = str(uuid.uuid4())
+        safe_filename = f"{unique_id}_{file.filename}"
+        path = os.path.join(TEMP_DIR, safe_filename)
+
+        with open(path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # We pass the safe_filename to create_job so the worker knows what to read
+        job_id = job_manager.create_job(safe_filename)
+        background_tasks.add_task(job_manager.process_job, job_id)
+
+        return {
+            "job_id": job_id,
+            "status": JobStatus.QUEUED,
+            "filename": safe_filename,
+            "message": "File uploaded and processing started."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/process/{filename}", response_model=JobResponse)
+async def start_process_existing(filename: str, bg_tasks: BackgroundTasks):
+    """Starts processing for an already uploaded file."""
+    if not os.path.exists(os.path.join(TEMP_DIR, filename)):
+        raise HTTPException(status_code=404, detail="File not found in temp storage.")
+
+    job_id = job_manager.create_job(filename)
+    bg_tasks.add_task(job_manager.process_job, job_id)
+    
+    return {
+        "job_id": job_id,
+        "status": JobStatus.QUEUED,
+        "filename": filename,
+        "message": "Processing started."
+    }
+
+@app.get("/job/{job_id}", response_model=JobStatusResponse)
+def get_job_status(job_id: str):
+    """Get status of a specific job."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 @app.get("/magic")
-def get_results():
+def get_results_legacy():
+    """Legacy endpoint to list all results."""
     files = sorted([f for f in os.listdir(OUTPUT_DIR) if f.lower().endswith('.png')])
-    return [{"name": f, "url": f"http://localhost:8000/output/{f}"} for f in files]
-
-def process_image_pipeline(filename: str):
-    STATUS["state"] = "PROCESSING"
-    STATUS["current_file"] = filename
-    
-    input_path = os.path.join(TEMP_DIR, filename)
-    img = cv2.imread(input_path)
-    
-    if img is None:
-        STATUS["state"] = "ERROR_READ"
-        return
-
-    crops = perform_watershed(img, 0.2, 3, 2)
-    if not crops: crops = perform_watershed(img, 0.4, 3, 1)
-    if not crops: crops = perform_glue(img)
-    
-    if not crops:
-        print(f"Failed to cut {filename}")
-        STATUS["state"] = "CUT_FAIL"
-        return
-
-    for idx, pil_crop in enumerate(crops):
-        base_name = os.path.splitext(filename)[0]
-        save_name = f"{base_name}_restored_{idx+1:02d}.png"
-        save_path = os.path.join(OUTPUT_DIR, save_name)
-        if not os.path.exists(save_path):
-            restore_image_generative(pil_crop, save_path)
-    
-    STATUS["state"] = "IDLE"
-    STATUS["current_file"] = ""
-    STATUS["queue"] = max(0, STATUS["queue"] - 1)
-
-@app.post("/process/{filename}")
-async def start_process(filename: str, bg_tasks: BackgroundTasks):
-    bg_tasks.add_task(process_image_pipeline, filename)
-    return {"status": "Started", "target": filename}
+    # Assuming localhost for simplicity as in original code, but could be dynamic
+    return [{"name": f, "url": f"/output/{f}"} for f in files]
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
