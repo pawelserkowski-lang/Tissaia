@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.DS_Store
+temp_input/
+odnowione_final/
+*.png
+*.jpg
+*.jpeg
+*.zip
