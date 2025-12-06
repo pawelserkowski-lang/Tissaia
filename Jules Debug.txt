@@ -1,0 +1,68 @@
+Raport Analizy Architektonicznej i Debugowania (Tissaia Project / Jules Proxy)
+Poniżej znajduje się dogłębna analiza obecnego repozytorium (Tissaia_Project), przeprowadzona zgodnie z metodologią "Jules", z mapowaniem pojęć rozszerzenia CLI na obecną architekturę mikroserwisową (FastAPI/Docker).
+
+Faza 1: Analiza Kontekstowa i Architektury (Mapowanie na Docker/FastAPI)
+1.1. Konfiguracja i Manifest (docker-compose.yml / config.py)
+Stan obecny: Projekt nie korzysta z gemini-extension.json, lecz z docker-compose.yml oraz src/config.py.
+Analiza:
+Dockerfile bazuje na python:3.11-slim, co jest dobrym standardem (lekkim i bezpiecznym).
+Zmienna GOOGLE_API_KEY jest poprawnie wstrzykiwana z .env, ale w docker-compose.yml brakuje flagi read_only: true dla kontenera (security).
+Tryb --reload w docker-compose.yml jest włączony na sztywno, co jest niebezpieczne w produkcji (Code Injection / Performance).
+Uzasadnienie: Oddzielenie konfiguracji deweloperskiej od produkcyjnej jest kluczowe dla bezpieczeństwa i wydajności.
+Kroki Wdrożenia:
+Utworzyć docker-compose.prod.yml bez flagi --reload.
+Dodać healthcheck w docker-compose.yml, aby orkiestrator wiedział, kiedy API wstało.
+1.2. Ocena Promptów Systemowych (src/ai_core.py)
+Analiza: Prompt w restore_image_generative jest ustrukturyzowany (ROLE, TASK, OUTPUT), co jest zgodne z dobrymi praktykami.
+Ryzyko: Prompt prosi o "Return ONLY the raw restored image". Modele Gemini zwracają strukturę JSON z inlineData. Jeśli model spróbuje zwrócić binaria jako tekst, parsowanie JSON w kodzie (response.json()) może się nie powieść, chociaż API zazwyczaj to narzuca.
+Uzasadnienie: Precyzja formatu wyjściowego (np. wymuszenie JSON lub MIME type w generationConfig) zmniejsza ryzyko błędów parsowania.
+Kroki Wdrożenia:
+W generationConfig (plik src/ai_core.py) ustawić "responseMimeType": "application/json" (jeśli model to wspiera) lub doprecyzować w prompcie: "Return the image provided in the standard API response structure".
+1.3. Optymalizacja Endpointów ("Slash Commands")
+Stan obecny: Użytkownik musi wykonać dwa żądania:
+POST /upload (przesłanie plików)
+POST /process/{filename} (uruchomienie przetwarzania)
+Analiza: To "wąskie gardło" interakcji. Wymaga od klienta (frontendu/CLI) zarządzania stanem (pamiętanie nazwy pliku).
+Uzasadnienie: Redukcja RTT (Round Trip Time) i uproszczenie logiki klienta.
+Kroki Wdrożenia:
+Scalić te operacje w jeden endpoint POST /process_upload, który przyjmuje plik i od razu zleca BackgroundTasks.
+Faza 2: Analiza Kodu, Logiki Asynchronicznej i Debugowanie
+2.1. Przepływ Kontroli i Retry (src/utils.py)
+Analiza: Funkcja make_request_with_retry stosuje prosty backoff liniowy: time.sleep((i + 1) * 2).
+Dla błędów 429 (Rate Limit) zalecany jest Exponential Backoff (wykładniczy).
+api_server.py nie posiada globalnego try-catch dla wątków tła (BackgroundTasks). Jeśli process_image_pipeline rzuci wyjątek, wątek umiera cicho (chyba że uvicorn to zaloguje), a stan STATUS może utknąć na "PROCESSING".
+Kroki Wdrożenia:
+Zmienić time.sleep na time.sleep(2 ** i + random.uniform(0, 1)).
+Otoczyć ciało process_image_pipeline blokiem try...except Exception z logowaniem błędu i resetem stanu STATUS["state"] = "ERROR".
+2.2. Wąskie Gardła i Wyścigi (Race Conditions) - KRYTYCZNE
+Identyfikacja: Zmienna globalna STATUS w api_server.py:
+STATUS = { "state": "IDLE", "current_file": "" }
+Scenariusz błędu:
+Użytkownik A wysyła żądanie przetworzenia pliku X.jpg -> STATUS ustawia się na X.jpg.
+Użytkownik B (lub ten sam w nowej karcie) wysyła Y.jpg chwilę później.
+api_server (wielowątkowy) nadpisuje STATUS["current_file"] na Y.jpg.
+Użytkownik A sprawdza status i widzi, że przetwarza się Y.jpg (lub stan skacze).
+Uzasadnienie: Globalny stan w pamięci RAM jest nieakceptowalny dla serwera API obsługującego >1 żądanie.
+Kroki Wdrożenia:
+Wprowadzić UUID dla każdego zadania.
+Przechowywać stan w słowniku JOBS = { "uuid": { "status": "PROCESSING", ... } }.
+Endpoint /process powinien zwracać job_id, a /status przyjmować job_id.
+2.3. Zarządzanie Stanem
+Analiza: Stan jest ulotny (w pamięci). Restart kontenera czyści kolejkę i statusy, ale pliki zostają na dysku (/temp, /output). Powoduje to desynchronizację (pliki są, wiedza o nich znika).
+Rozwiązanie: Przy starcie aplikacji (@app.on_event("startup")) należy zeskanować katalogi i odbudować wstępny stan lub użyć lekkiej bazy danych (SQLite).
+Faza 3: Propozycje Refaktoryzacji i Testowalność
+3.1. Modularność (Separation of Concerns)
+Problem: api_server.py zawiera logikę biznesową (perform_watershed, logika pętli po cropach). To narusza zasadę Single Responsibility.
+Propozycja Refaktoryzacji:
+Wydzielić src/engine.py (lub src/pipeline.py), który zawiera klasę RestorationPipeline.
+api_server.py powinien tylko przyjmować żądania i wywoływać metody z engine.py.
+Nazewnictwo: Zmienić perform_glue (niejasne) na merge_image_segments lub stitch_fragments.
+3.2. Testowalność (Mockowanie)
+Problem: ai_core.py importuje requests i uderza bezpośrednio w Google API. Testy integracyjne zużywają tokeny i są wolne.
+Plan Mockowania:
+Wprowadzić Dependency Injection dla klienta HTTP.
+Stworzyć MockGeminiClient, który zwraca spreparowany JSON z base64 obrazka testowego.
+Testy jednostkowe powinny sprawdzać, czy process_image_pipeline poprawnie obsługuje błędy API (np. 500, 429) bez dzwonienia do Google.
+3.3. Dokumentacja
+Braki: Brak README.md. Nowy programista nie wie, jak uruchomić projekt (musi czytać kod create_structure.py).
+Naprawa: Utworzyć README.md z sekcjami: "Instalacja (Docker)", "API Reference", "Zmienne środowiskowe".
