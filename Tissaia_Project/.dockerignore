@@ -1,7 +1,8 @@
 __pycache__
 *.pyc
-.env
 .git
 .gitignore
+venv
+env
 temp_input
 odnowione_final
