@@ -1,0 +1,16 @@
+services:
+  tissaia-backend:
+    build: .
+    image: tissaia-v14-backend
+    container_name: tissaia_core
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./temp_input:/app/temp_input
+      - ./odnowione_final:/app/odnowione_final
+      - ./src:/app/src
+      - ./api_server.py:/app/api_server.py
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    restart: unless-stopped
+    command: uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload

@@ -1,7 +1,0 @@
-services:
-  tissaia-verify:
-    build: .
-    image: tissaia-v14-total-war
-    volumes:
-      - .:/app
-    command: python verify_tissaia_v14.py
