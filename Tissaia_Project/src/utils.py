@@ -1,6 +1,5 @@
 import time, random, io, base64, requests
 from PIL import Image
-
 def encode_image_optimized(path, max_size=3500, quality=93):
     with Image.open(path) as img:
         if img.mode != "RGB": img = img.convert("RGB")
@@ -9,19 +8,14 @@ def encode_image_optimized(path, max_size=3500, quality=93):
         img.save(buf, format="JPEG", quality=quality)
         return base64.b64encode(buf.getvalue()).decode('utf-8')
 
-def make_request_with_retry(url, json_payload, headers, max_retries=5):
-    if not headers.get("x-goog-api-key"): return None
+def make_request_with_retry(url, json_payload, headers, max_retries=10):
     for i in range(max_retries):
         try:
             r = requests.post(url, json=json_payload, headers=headers, timeout=600)
-            if r.status_code == 404: 
-                if "v1beta" in url: 
-                    url = url.replace("v1beta", "v1alpha")
-                    continue
-                return r
+            if r.status_code == 404: return r
             if r.status_code in [429, 500, 503]:
-                time.sleep((i + 1) * 2)
+                time.sleep((i + 1) * 2 + random.randint(1, 5))
                 continue
             return r
-        except: time.sleep(1)
+        except: time.sleep(2)
     return None
